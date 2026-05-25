@@ -55,6 +55,150 @@ Secondary issues (missing prototypes, unused variables, filldir_t type) were pat
 
 ---
 
+## Troubleshooting Narrative
+
+This section tells the story of the debugging session in order. It is meant to be useful context for anyone who hits similar issues and wants to understand not just the patches, but the process of finding them.
+
+### Session Start: apt upgrade fails
+
+Running `sudo apt upgrade` on Linux Mint 22 (Ubuntu 24.04 base) pulled in `linux-image-6.8.0-117-generic` and `linux-headers-6.8.0-117-generic`. The DKMS post-install hook fired for `nvidia/390.157` and failed. `apt` exited with code 100. Four packages were left half-installed/unconfigured, and subsequent `apt` commands refused to run:
+
+```
+E: Sub-process /usr/bin/dpkg returned an error code (1)
+```
+
+First action: look at the actual DKMS build log.
+
+```bash
+sudo cat /var/lib/dkms/nvidia/390.157/build/make.log | grep -E '^[^ ].*(error:|warning:|Error)' | head -30
+```
+
+The log was thousands of lines long but the first real error jumped out immediately:
+
+```
+nv-mmap.c:123:42: error: too many arguments to function 'get_user_pages_remote'
+```
+
+Same error in dozens of files. Everything downstream was blocked by this single API mismatch.
+
+### Build Attempt 1: `get_user_pages_remote` — wrong number of arguments
+
+The first thing to understand was *why* the driver was calling `get_user_pages_remote` with the wrong signature. The call site was a macro in `common/inc/nv-mm.h`. The macro was conditionally compiled based on flags set by `conftest.sh` — the script that probes the running kernel's API at build time and generates `conftest/functions.h`, `conftest/types.h`, and `conftest/generic.h`.
+
+Inspecting `conftest.sh` (in `/usr/src/nvidia-390.157/`) revealed four test cases for `get_user_pages_remote`. The most recent one (test #4) tried the kernel 5.9 signature where `tsk` was removed but `vmas` was still present. But the kernel 6.5 change (commit `ca5e863233e8`) also removed `vmas`, leaving a 6-argument form `(mm, start, nr_pages, gup_flags, pages, locked)` that matched none of the four tests.
+
+When all four tests fail, `conftest.sh` falls through to its default, which incorrectly sets `HAS_TSK_ARG` (implying the oldest API form). Every file that included `nv-linux.h` then tried to call `get_user_pages_remote` with the original 8-argument signature — and every one of those failed with "too many arguments."
+
+**Fix:** Added a new conftest test #5 for the kernel 6.5+ 6-arg form, added a new `NV_GET_USER_PAGES_REMOTE_HAS_VMAS_ARG` tracking flag, tagged tests #2/#3/#4 with that flag, and added the corresponding call path in `nv-mm.h`.
+
+Rebuilt with `sudo dkms build nvidia/390.157 -k 6.8.0-117-generic`. First build error was gone. Next error surfaced:
+
+```
+os-mlock.c:67:34: error: too many arguments to function 'get_user_pages'
+```
+
+### Build Attempt 2: `get_user_pages` — same root cause
+
+Identical issue with the non-remote `get_user_pages` conftest. Three existing test cases, none matching the kernel 6.5 4-argument form `(start, nr_pages, gup_flags, pages)`. Same fix pattern: added test #4, new `HAS_VMAS_ARG` flag, updated call site in `nv-mm.h`.
+
+Rebuilt. `os-mlock.c` error gone. Next error:
+
+```
+nv-mmap.c:244:17: error: assignment of read-only member 'vm_flags'
+```
+
+### Build Attempt 3: `vma->vm_flags` is read-only (kernel 6.3+)
+
+Kernel 6.3 (commit `bc292ab00f6c`) changed `vma->vm_flags` to `const vm_flags_t`. Direct assignment (`vma->vm_flags |= ...`) and masking (`vma->vm_flags &= ~...`) both now fail. The kernel introduced `vm_flags_set()` and `vm_flags_clear()` as the correct API.
+
+Fixed `nvidia/nv-mmap.c` by adding helper macros gated on `LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)` and replacing all six direct flag assignments.
+
+Rebuilt. `nv-mmap.c` clean. New error from a different module:
+
+```
+nvidia-uvm/uvm8.c:4521:32: error: assignment of read-only member 'vm_flags'
+```
+
+### Build Attempt 4: UVM module — same vm_flags issue
+
+The UVM (Unified Virtual Memory) module has its own copy of the pattern. Applied the same kernel 6.3 guard inline in `nvidia-uvm/uvm8.c`. Rebuilt. UVM error gone. New errors:
+
+```
+nv-kernel.o: objtool: retpoline check failed
+nv.o: Error
+```
+
+### Build Attempt 5: objtool retpoline check on precompiled binary
+
+`nv-kernel.o_binary` is a precompiled binary object blob included in the 390.157 source tree. It contains indirect calls/jumps that don't use retpoline wrappers. Kernel 6.8's `objtool` validates all linked objects for retpoline compliance (`CONFIG_MITIGATION_RETPOLINE`) and rejects objects that don't pass.
+
+Since the blob is a closed binary, it cannot be recompiled. The standard kernel approach for modules with precompiled components is `OBJECT_FILES_NON_STANDARD := y` in the Kbuild file, which instructs `objtool` to skip all objects in that module.
+
+Added to `nvidia/nvidia.Kbuild`. Rebuilt. `objtool` error gone. New errors from `nvidia-drm`:
+
+```
+nvidia-drm/nvidia-drm-drv.c:312:37: error: 'DRM_UNLOCKED' undeclared
+nvidia-drm/nvidia-drm-drv.c:419:25: error: 'struct drm_driver' has no member named 'dumb_destroy'
+```
+
+### Build Attempt 6: DRM API removals (kernel 6.8)
+
+Two DRM items were removed in kernel 6.8:
+
+1. **`DRM_UNLOCKED`** — Had been a no-op flag since all DRM ioctls became unlocked in kernel 4.x. The macro itself was finally deleted in 6.8. Fix: add `#ifndef DRM_UNLOCKED / #define DRM_UNLOCKED 0 / #endif` before the ioctl table.
+
+2. **`dumb_destroy` in `struct drm_driver`** — Generic GEM dumb buffer destroy was centralized in kernel 6.8, removing the per-driver callback. Fix: guard the assignment with a `LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)` check.
+
+Rebuilt. `nvidia-drm-drv.c` clean. New error:
+
+```
+nvidia-drm/nvidia-drm-fb.c:67:3: error: implicit declaration of function 'drm_helper_mode_fill_fb_struct'
+```
+
+### Build Attempt 7: `drm_helper_mode_fill_fb_struct` removed (kernel 5.14)
+
+This function was removed in kernel 5.14 (commit `2cb0d7f7ea98`). The driver's `conftest.sh` has a test for it, but the test is flawed: it tries to *redefine* the function to detect it. If the kernel header doesn't declare the function, the redefinition compiles successfully — so the conftest incorrectly reports it as "present." The actual call site then hits an implicit-declaration error.
+
+Since `nvidia_drv-fb.c` needs this function and the kernel no longer provides it, the fix is a static fallback implementation, gated on `LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0)`, that manually fills the framebuffer struct fields using the `drm_mode_fb_cmd2` data.
+
+Rebuilt. Alongside this, a batch of secondary warnings-promoted-to-errors were addressed proactively (these had all been visible earlier in the make.log but were unreachable until the primary errors were resolved):
+
+- `nv-dma.c`: `nv_load_dma_map_scatterlist` had no forward declaration
+- `nv-instance.c`: missing `#include "nv-instance.h"` for `nv_pci_register_driver` prototype
+- `nv.c`: `nvidia_init_module` and `nvidia_exit_module` lacked forward declarations
+- `nv-acpi.c`: `struct acpi_device *device` declared at function scope but only used inside a `#ifdef` block that evaluated to false on this system → unused variable error
+- `nv-gpu-numa.c`: `filldir_t` return type changed from `int` to `bool` in kernel 6.1
+
+**Build attempt 7 succeeded.** Both `nvidia.ko` and `nvidia-drm.ko` built and were signed. DKMS status showed:
+
+```
+nvidia/390.157, 6.8.0-117-generic, x86_64: installed
+```
+
+### Post-Build: dpkg recovery
+
+With the modules installed, `sudo dpkg --configure -a` and `sudo apt --fix-broken install` completed cleanly. All four previously-stuck packages configured successfully. `sudo dpkg --audit` returned empty output.
+
+### Reboot: blank screen
+
+System rebooted into kernel 6.8 and hung at the Plymouth splash screen. No desktop appeared. This was a separate problem from the DKMS build failure.
+
+Diagnosed from recovery mode using `journalctl -b -1 -p err --no-pager`. Xorg was crashing with a SIGSEGV in `libglx.so` → `AddCallback` → `tcache_get_n`. The 390.157 `nvidia_drv.so` (a precompiled Xorg DDX driver binary compiled against Xorg ~1.13) is ABI-incompatible with the modern Xorg 21.x server in Ubuntu 24.04. The crash is inside a closed binary — not patchable.
+
+The system was loading `nvidia_drv.so` because `/usr/share/X11/xorg.conf.d/10-nvidia.conf` and `11-nvidia-prime.conf` contain `OutputClass` sections that match any device driven by `nvidia-drm` and forcibly load the NVIDIA Xorg DDX driver.
+
+`/etc/X11/xorg.conf.d/` overrides were tried first but were ineffective: Xorg processes `/etc/X11/xorg.conf.d/` *before* `/usr/share/X11/xorg.conf.d/`, so the system configs won out.
+
+**Fix:** Rename/disable both system OutputClass configs and mask `gpu-manager` (which regenerates one of them on every boot). Without those configs, Xorg auto-selects the `modesetting` DDX driver, which drives the display via `nvidia-drm` KMS — no `nvidia_drv.so` involved. Adding `nvidia-drm.modeset=1` to the kernel command line in GRUB ensures the KMS interface is available.
+
+Rebooted. Desktop environment loaded normally.
+
+### Verification
+
+`nvidia-smi` confirmed driver version 390.157 on NVS 5400M. `dkms status` confirmed module installed for 6.8.0-117-generic. `dpkg --audit` clean. System fully up to date.
+
+---
+
 ## All Patches Applied
 
 All files are relative to `/usr/src/nvidia-390.157/`.
